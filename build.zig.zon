@@ -1,0 +1,19 @@
+.{
+    .name = "zrbx-dom",
+    .version = "0.0.1",
+    .minimum_zig_version = "0.13.0",
+    .dependencies = .{
+        .lz4 = .{
+            .url = "https://codeload.github.com/SnorlaxAssist/zig-lz4/tar.gz/9ee5c6f8c6a50c1e2b5193d8bf41c0eda8dbd206",
+            .hash = "1220d6bbca59a59f16bda33b69e140d90bad313d11c07c0e2ab16076c59355845112",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        // For example...
+        //"LICENSE",
+        //"README.md",
+    },
+}
