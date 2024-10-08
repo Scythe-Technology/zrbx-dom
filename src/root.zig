@@ -1,7 +1,7 @@
 const std = @import("std");
 const lz4 = @import("lz4");
 
-const Roblox = @import("roblox.zig");
+pub const Roblox = @import("roblox.zig");
 const Binary = @import("./formats/binary.zig");
 
 const Dom = struct {};
@@ -32,19 +32,14 @@ pub fn serialize(doc: Roblox.Document, encoding: Encoding) ![]const u8 {
     }
     return "NOTHING";
 }
+pub fn deserialize(allocator: std.mem.Allocator, contents: []const u8) !Roblox.Document {
+    if (contents.len < 14)
+        return Roblox.DeserializeError.UnknownEncoding;
 
-pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Roblox.Document {
-    const compressed = try lz4.Standard.compress(std.testing.allocator, "test");
-    defer std.testing.allocator.free(compressed);
-
-    var data: [14]u8 = undefined;
-    const amount = try reader.read(&data);
-    if (amount < 14) return Roblox.DeserializeError.UnknownEncoding;
-
-    const encoding = EncodingMap.get(&data) orelse EncodingMap.get(data[0..7]) orelse return Roblox.DeserializeError.UnknownEncoding;
+    const encoding = EncodingMap.get(contents[0..14]) orelse EncodingMap.get(contents[0..7]) orelse return Roblox.DeserializeError.UnknownEncoding;
 
     switch (encoding) {
-        .Binary => return try Binary.deserialize(allocator, reader),
+        .Binary => return try Binary.deserialize(allocator, contents[14..]),
         .Xml => {
             std.debug.print("XML\n", .{});
         },
@@ -68,15 +63,16 @@ test "Binary" {
 
     const file = try getTestFile("places/baseplate-566/binary.rbxl");
 
-    var doc = try deserialize(allocator, file.reader());
+    const contents = try file.reader().readAllAlloc(allocator, std.math.maxInt(usize));
+    defer allocator.free(contents);
+
+    var doc = try deserialize(allocator, contents);
     defer doc.deinit();
 
     const slice = try serialize(doc, .Binary);
     defer allocator.free(slice);
 
-    var sample = std.io.fixedBufferStream(slice);
-
-    var doc2 = try deserialize(allocator, sample.reader());
+    var doc2 = try deserialize(allocator, slice);
     defer doc2.deinit();
 }
 

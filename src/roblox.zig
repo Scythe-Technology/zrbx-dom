@@ -21,7 +21,6 @@ pub const Instance = struct {
     ClassName: []const u8,
     Referent: i32,
     Parent: ?u32,
-    Childs: std.ArrayList(*Instance),
     Properties: std.StringArrayHashMap(Property),
     IsService: bool,
 };
@@ -55,10 +54,10 @@ pub const Value = union(enum) {
     Axes: u8,
     BrickColor: i32,
     Color3: struct { f32, f32, f32 },
-    Vector2: struct { f32, f32 },
-    Vector3: struct { f32, f32, f32 },
+    Vector2: [2]f32,
+    Vector3: [3]f32,
     CFrame: struct { f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32 },
-    Enum: struct { u32, []const u8 }, // TODO
+    Enum: u32,
     Ref: ?u32,
     Vector3int16: struct { i16, i16, i16 },
     NumberSequence: []struct { f32, f32, f32 },
@@ -211,7 +210,6 @@ pub const Document = struct {
             }
             self.allocator.free(instance.ClassName);
             instance.Properties.deinit();
-            instance.Childs.deinit();
         }
         self.instances.deinit();
         for (self.classes.items) |class| {

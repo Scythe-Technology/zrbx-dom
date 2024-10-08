@@ -27,6 +27,7 @@ pub const BinaryChunkTypeMap = std.StaticStringMap(BinaryChunkType).initComptime
 });
 
 pub const DeserializeError = error{
+    BadChunk,
     BadParentFormat,
     BadSharedStringFormat,
     BadDataNoEnd,
@@ -41,7 +42,8 @@ pub const Chunk = struct {
     Allocated: bool = false,
 
     pub fn deinit(self: Chunk, allocator: std.mem.Allocator) void {
-        if (self.Allocated) allocator.free(self.Data);
+        if (self.Allocated)
+            allocator.free(self.Data);
     }
 
     pub const Reader = struct {
@@ -201,8 +203,12 @@ pub const Chunk = struct {
                 else => |t| @tagName(t),
             });
 
-            const compressed = if (compress) try lz4.Standard.compress(self.allocator, self.list.items) else self.list.items;
-            defer if (compress) self.allocator.free(compressed);
+            const compressed = if (compress)
+                try lz4.Standard.compress(self.allocator, self.list.items)
+            else
+                self.list.items;
+            defer if (compress)
+                self.allocator.free(compressed);
 
             try WriteIntType(u32, wr, if (compress) @as(u32, @intCast(compressed.len)) else 0);
             try WriteIntType(u32, wr, @as(u32, @intCast(self.list.items.len)));
@@ -225,21 +231,28 @@ pub fn WriteIntType(comptime T: type, writer: anytype, value: T) !void {
 
 pub fn readArrayListSome(reader: anytype, arrayList: *std.ArrayList(u8), amount: usize) ![]const u8 {
     const before = arrayList.items.len;
+
     try arrayList.ensureTotalCapacityPrecise(before + amount);
     arrayList.expandToCapacity();
+
     const slice = arrayList.items[before..];
     const amount_read = try reader.readAll(slice);
-    if (amount_read != amount) return error.Failed;
+    if (amount_read != amount)
+        return error.Failed;
+
     return arrayList.items[before..];
 }
 
-pub fn readChunk(reader: anytype, bytes: *std.ArrayList(u8)) !Chunk {
-    const data = try readArrayListSome(reader, bytes, 16);
+pub fn readChunk(allocator: std.mem.Allocator, slice: []const u8) !struct { Chunk, usize } {
+    if (slice.len < 16)
+        return error.Fail;
 
-    const chunk_type = data[0..4];
-    const compressed_size = std.mem.readVarInt(u32, data[4..8], .little);
-    const size = std.mem.readVarInt(u32, data[8..12], .little);
-    const reserved = std.mem.readVarInt(u32, data[12..16], .little);
+    const chunk_type = slice[0..4];
+    const compressed_size = std.mem.readVarInt(u32, slice[4..8], .little);
+    const size = std.mem.readVarInt(u32, slice[8..12], .little);
+    const reserved = std.mem.readVarInt(u32, slice[12..16], .little);
+
+    const data = slice[16..];
 
     var chunk = Chunk{
         .Type = BinaryChunkTypeMap.get(chunk_type) orelse return error.Fail,
@@ -248,28 +261,33 @@ pub fn readChunk(reader: anytype, bytes: *std.ArrayList(u8)) !Chunk {
         .Size = size,
     };
 
+    var pos: usize = 0;
     if (compressed_size > 0) {
-        const compressed = try readArrayListSome(reader, bytes, @intCast(compressed_size));
+        pos += @intCast(compressed_size);
+        const compressed = data[0..pos];
         if (compressed[0] == 0x58 or compressed[0] == 0x78) {
             std.debug.print("zlib: {s}\n", .{compressed});
-            var writer = std.ArrayList(u8).init(bytes.allocator);
+            var writer = std.ArrayList(u8).init(allocator);
             var fixed_reader = std.io.fixedBufferStream(compressed);
             try std.compress.zlib.decompress(fixed_reader.reader(), writer.writer());
             chunk.Data = try writer.toOwnedSlice();
             chunk.Allocated = true;
         } else if (std.mem.eql(u8, compressed[1..3], &.{ 0xB5, 0x2F, 0xFD })) {
             std.debug.print("zstd: {s}\n", .{compressed});
-            chunk.Data = try std.compress.zstd.decompress.decodeAlloc(bytes.allocator, compressed, true, 4096);
+            chunk.Data = try std.compress.zstd.decompress.decodeAlloc(allocator, compressed, true, 4096);
             chunk.Allocated = true;
         } else {
-            chunk.Data = try lz4.Standard.decompress(bytes.allocator, compressed, @intCast(size));
+            chunk.Data = try lz4.Standard.decompress(allocator, compressed, @intCast(size));
             chunk.Allocated = true;
         }
     } else {
-        chunk.Data = try readArrayListSome(reader, bytes, @intCast(size));
+        pos += @intCast(size);
+        chunk.Data = data[0..pos];
     }
 
-    return chunk;
+    pos += 16;
+
+    return .{ chunk, pos };
 }
 
 pub fn ReadInterleaved(comptime T: type, comptime transform: fn (*[@sizeOf(T)]u8) T) fn (allocator: std.mem.Allocator, buf: []const u8, count: usize) anyerror![]T {
@@ -278,11 +296,13 @@ pub fn ReadInterleaved(comptime T: type, comptime transform: fn (*[@sizeOf(T)]u8
         fn inner(allocator: std.mem.Allocator, buf: []const u8, count: usize) ![]T {
             const values = try allocator.alloc(T, count);
             errdefer allocator.free(values);
-            if (buf.len < count * size) return error.Fail;
+            if (buf.len < count * size)
+                return error.Fail;
 
             for (0..count) |offset| {
                 var bytes: [size]u8 = undefined;
-                inline for (0..size) |i| bytes[i] = buf[(i * count) + offset];
+                inline for (0..size) |i|
+                    bytes[i] = buf[(i * count) + offset];
                 values[offset] = transform(&bytes);
             }
 
@@ -320,7 +340,8 @@ pub fn WriteInterleaved(comptime T: type, comptime transform: fn (T) T) fn (allo
             }
 
             for (0..size) |i| {
-                for (0..count) |c| try writer.writeByte(buf[(c * size) + i]);
+                for (0..count) |c|
+                    try writer.writeByte(buf[(c * size) + i]);
             }
         }
     }.inner;
@@ -407,16 +428,18 @@ pub fn serialize(
     const bufwriter = buffer.writer();
 
     for (instances.items) |item| {
-        if (item.Properties.get("Archivable")) |prop| switch (prop.Value) {
-            .Bool => |b| if (b) continue,
-            else => {},
-        };
+        if (item.Properties.get("Archivable")) |prop|
+            switch (prop.Value) {
+                .Bool => |b| if (b) continue,
+                else => {},
+            };
 
         var existing_class = class_map.getPtr(item.ClassName);
         if (existing_class == null) {
             var count: usize = 0;
             for (instances.items) |v| {
-                if (std.mem.eql(u8, v.ClassName, item.ClassName)) count += 1;
+                if (std.mem.eql(u8, v.ClassName, item.ClassName))
+                    count += 1;
             }
 
             try class_map.put(item.ClassName, Roblox.Class{
@@ -474,7 +497,10 @@ pub fn serialize(
         for (sharedstrings.items) |*shared| {
             try chunk.writeAll(&[_]u8{ 0, 0, 0, 0 } ** 4);
 
-            if (shared.find(shared.Key)) |string| try chunk.writeBuffer(string) else @panic("Missing string");
+            if (shared.find(shared.Key)) |string|
+                try chunk.writeBuffer(string)
+            else
+                @panic("Missing string");
         }
 
         try chunk.finalize(bufwriter, true);
@@ -497,7 +523,8 @@ pub fn serialize(
 
     var class_iter = class_map.iterator();
     while (class_iter.next()) |entry| {
-        if (entry.value_ptr.instances_len == 0) continue;
+        if (entry.value_ptr.instances_len == 0)
+            continue;
 
         var chunk = Chunk.Writer.init(allocator, .INST);
         defer chunk.deinit();
@@ -530,12 +557,15 @@ pub fn serialize(
 
     class_iter = class_map.iterator();
     while (class_iter.next()) |entry| {
-        if (entry.value_ptr.instances_len == 0) continue;
+        if (entry.value_ptr.instances_len == 0)
+            continue;
         const instance = instances.items[@intCast(entry.value_ptr.instances[0])];
         var prop_iter = instance.Properties.iterator();
         while (prop_iter.next()) |prop_entry| {
-            if (std.mem.eql(u8, prop_entry.key_ptr.*, "Archivable")) continue;
-            if (std.mem.indexOfPosLinear(u8, prop_entry.key_ptr.*, 0, "__") != null) continue;
+            if (std.mem.eql(u8, prop_entry.key_ptr.*, "Archivable"))
+                continue;
+            if (std.mem.indexOfPosLinear(u8, prop_entry.key_ptr.*, 0, "__") != null)
+                continue;
 
             var chunk = Chunk.Writer.init(allocator, .PROP);
             defer chunk.deinit();
@@ -553,31 +583,37 @@ pub fn serialize(
             for (entry.value_ptr.instances, 0..) |id, o| {
                 const sub_instance = instances.items[@intCast(id)];
                 const prop_value = sub_instance.Properties.getPtr(prop_entry.key_ptr.*) orelse std.debug.panic("Missing property", .{});
-                if (@intFromEnum(prop_value.*.Type) != prop_typeid) std.debug.panic("Invalid property type", .{});
+                if (@intFromEnum(prop_value.*.Type) != prop_typeid)
+                    std.debug.panic("Invalid property type", .{});
                 property_values[o] = prop_value.*;
             }
 
             switch (prop_entry.value_ptr.Type) {
                 .String => {
-                    for (property_values) |value| try chunk.writeBuffer(value.Value.String);
+                    for (property_values) |value|
+                        try chunk.writeBuffer(value.Value.String);
                 },
                 .Bool => {
-                    for (property_values) |value| try chunk.writeByte(if (value.Value.Bool) 1 else 0);
+                    for (property_values) |value|
+                        try chunk.writeByte(if (value.Value.Bool) 1 else 0);
                 },
                 .Int => {
                     const values = try allocator.alloc(i32, property_values.len);
                     defer allocator.free(values);
-                    for (property_values, 0..) |value, i| values[i] = value.Value.Int;
+                    for (property_values, 0..) |value, i|
+                        values[i] = value.Value.Int;
                     try chunk.writeInterleavedi32(values);
                 },
                 .Float => {
                     const values = try allocator.alloc(f32, property_values.len);
                     defer allocator.free(values);
-                    for (property_values, 0..) |value, i| values[i] = value.Value.Float;
+                    for (property_values, 0..) |value, i|
+                        values[i] = value.Value.Float;
                     try chunk.writeInterleavedf32(values);
                 },
                 .Double => {
-                    for (property_values) |value| try chunk.writef64(value.Value.Double);
+                    for (property_values) |value|
+                        try chunk.writef64(value.Value.Double);
                 },
                 .UDim => {
                     const scale_values = try allocator.alloc(f32, property_values.len);
@@ -628,15 +664,18 @@ pub fn serialize(
                     }
                 },
                 .Faces => {
-                    for (property_values) |value| try chunk.writeByte(value.Value.Faces);
+                    for (property_values) |value|
+                        try chunk.writeByte(value.Value.Faces);
                 },
                 .Axes => {
-                    for (property_values) |value| try chunk.writeByte(value.Value.Axes);
+                    for (property_values) |value|
+                        try chunk.writeByte(value.Value.Axes);
                 },
                 .BrickColor => {
                     const values = try allocator.alloc(i32, property_values.len);
                     defer allocator.free(values);
-                    for (property_values, 0..) |value, i| values[i] = value.Value.BrickColor;
+                    for (property_values, 0..) |value, i|
+                        values[i] = value.Value.BrickColor;
                     try chunk.writeInterleavedi32(values);
                 },
                 .Color3 => {
@@ -694,12 +733,14 @@ pub fn serialize(
                     const z_values = try allocator.alloc(f32, property_values.len);
                     defer allocator.free(z_values);
 
-                    if (t == .OptionalCFrame) try chunk.writeByte(@intFromEnum(Roblox.Property.Type.CFrame) + 1);
+                    if (t == .OptionalCFrame)
+                        try chunk.writeByte(@intFromEnum(Roblox.Property.Type.CFrame) + 1);
 
                     for (property_values, 0..) |value, i| {
                         const cf_value: struct { f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32 } = cf: {
                             if (t == .OptionalCFrame) {
-                                if (value.Value.OptionalCFrame) |cf| break :cf cf;
+                                if (value.Value.OptionalCFrame) |cf|
+                                    break :cf cf;
                             } else break :cf value.Value.CFrame;
                             break :cf .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
                         };
@@ -767,27 +808,30 @@ pub fn serialize(
 
                     if (t == .OptionalCFrame) {
                         try chunk.writeByte(@intFromEnum(Roblox.Property.Type.Bool));
-                        for (property_values) |value| try chunk.writeByte(if (value.Value.OptionalCFrame != null) 1 else 0);
+                        for (property_values) |value|
+                            try chunk.writeByte(if (value.Value.OptionalCFrame != null) 1 else 0);
                     }
                 },
                 .Enum => {
                     const values = try allocator.alloc(u32, property_values.len);
                     defer allocator.free(values);
-                    for (property_values, 0..) |value, i| {
-                        const val, _ = value.Value.Enum;
-                        values[i] = val;
-                    }
+                    for (property_values, 0..) |value, i|
+                        values[i] = value.Value.Enum;
                     try chunk.writeInterleavedu32(values);
                 },
                 .Ref => {
                     const values = try allocator.alloc(i32, property_values.len);
                     defer allocator.free(values);
                     for (property_values, 0..) |value, i| {
-                        if (value.Value.Ref) |ref| values[i] = @intCast(ref) else values[i] = -1;
+                        if (value.Value.Ref) |ref|
+                            values[i] = @intCast(ref)
+                        else
+                            values[i] = -1;
                     }
                     const final_values = try allocator.dupe(i32, values);
                     defer allocator.free(final_values);
-                    for (1..final_values.len) |i| final_values[i] -= values[i - 1];
+                    for (1..final_values.len) |i|
+                        final_values[i] -= values[i - 1];
                     try chunk.writeInterleavedi32(final_values);
                 },
                 .Vector3int16 => {
@@ -886,17 +930,20 @@ pub fn serialize(
                 .Int64 => {
                     const values = try allocator.alloc(i64, property_values.len);
                     defer allocator.free(values);
-                    for (property_values, 0..) |value, i| values[i] = value.Value.Int64;
+                    for (property_values, 0..) |value, i|
+                        values[i] = value.Value.Int64;
                     try chunk.writeInterleavedi64(values);
                 },
                 .SharedString => {
                     const values = try allocator.alloc(u32, property_values.len);
                     defer allocator.free(values);
-                    for (property_values, 0..) |value, i| values[i] = value.Value.SharedString;
+                    for (property_values, 0..) |value, i|
+                        values[i] = value.Value.SharedString;
                     try chunk.writeInterleavedu32(values);
                 },
                 .ProtectedString => {
-                    for (property_values) |value| try chunk.writeBuffer(value.Value.ProtectedString);
+                    for (property_values) |value|
+                        try chunk.writeBuffer(value.Value.ProtectedString);
                 },
                 .UniqueId => {
                     const values = try allocator.alloc([16]u8, property_values.len);
@@ -925,7 +972,8 @@ pub fn serialize(
                 .SecurityCapabilities => {
                     const values = try allocator.alloc(u64, property_values.len);
                     defer allocator.free(values);
-                    for (property_values, 0..) |value, i| values[i] = value.Value.SecurityCapabilities;
+                    for (property_values, 0..) |value, i|
+                        values[i] = value.Value.SecurityCapabilities;
                     try chunk.writeInterleavedu64(values);
                 },
                 else => |t| std.debug.panic("(serialize) Unhandled type: {}\n", .{t}),
@@ -947,7 +995,10 @@ pub fn serialize(
 
         for (using_instances.items, 0..) |instance, i| {
             child_ids[i] = instance.Referent;
-            if (instance.Parent) |parent| parent_ids[i] = @intCast(parent) else parent_ids[i] = -1;
+            if (instance.Parent) |parent|
+                parent_ids[i] = @intCast(parent)
+            else
+                parent_ids[i] = -1;
         }
 
         const final_child_ids = try allocator.dupe(i32, child_ids);
@@ -955,8 +1006,10 @@ pub fn serialize(
         const final_parent_ids = try allocator.dupe(i32, parent_ids);
         defer allocator.free(final_parent_ids);
 
-        for (1..child_ids.len) |i| final_child_ids[i] -= child_ids[i - 1];
-        for (1..parent_ids.len) |i| final_parent_ids[i] -= parent_ids[i - 1];
+        for (1..child_ids.len) |i|
+            final_child_ids[i] -= child_ids[i - 1];
+        for (1..parent_ids.len) |i|
+            final_parent_ids[i] -= parent_ids[i - 1];
 
         try chunk.writeByte(0);
         try chunk.writeIntType(u32, @intCast(child_ids.len));
@@ -979,17 +1032,14 @@ pub fn serialize(
     return try buffer.toOwnedSlice();
 }
 
-pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Roblox.Document {
-    var array = std.ArrayList(u8).init(allocator);
+pub fn deserialize(allocator: std.mem.Allocator, slice: []const u8) !Roblox.Document {
+    if (slice.len < 18)
+        return DeserializeError.BadChunk;
 
-    defer array.deinit();
-
-    const bdata = try readArrayListSome(reader, &array, 18);
-
-    const version = std.mem.readVarInt(u16, bdata[0..2], .little);
-    const classes = std.mem.readVarInt(u32, bdata[2..6], .little);
-    const instances = std.mem.readVarInt(u32, bdata[6..10], .little);
-    const reserved = std.mem.readVarInt(i64, bdata[10..18], .little);
+    const version = std.mem.readVarInt(u16, slice[0..2], .little);
+    const classes = std.mem.readVarInt(u32, slice[2..6], .little);
+    const instances = std.mem.readVarInt(u32, slice[6..10], .little);
+    const reserved = std.mem.readVarInt(i64, slice[10..18], .little);
 
     var doc = try Roblox.Document.init(allocator, .{
         .classes = classes,
@@ -1008,9 +1058,12 @@ pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Roblox.Docume
     // });
 
     var ended = false;
+    var pos: usize = 18;
     while (true) {
-        const chunk = try readChunk(reader, &array);
+        const chunk, const read_size = try readChunk(allocator, slice[pos..]);
         defer chunk.deinit(allocator);
+
+        pos += read_size;
 
         var chunk_reader = Chunk.Reader{
             .buffer = chunk.Data,
@@ -1035,7 +1088,6 @@ pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Roblox.Docume
                         .IsService = is_service,
                         .ClassName = try allocator.dupe(u8, class_name),
                         .Parent = null,
-                        .Childs = std.ArrayList(*Roblox.Instance).init(allocator),
                         .Properties = std.StringArrayHashMap(Roblox.Property).init(allocator),
                     };
                     errdefer allocator.free(inst.ClassName);
@@ -1069,7 +1121,8 @@ pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Roblox.Docume
                 const format = try chunk_reader.readByte();
                 const count: usize = @intCast(try chunk_reader.readVarInt(u32, .little, 4));
 
-                if (format != 0) return DeserializeError.BadParentFormat;
+                if (format != 0)
+                    return DeserializeError.BadParentFormat;
 
                 const childs_list = try chunk_reader.readAllocInstances(allocator, count);
                 const parents_list = try chunk_reader.readAllocInstances(allocator, count);
@@ -1079,7 +1132,8 @@ pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Roblox.Docume
                 for (0..count) |i| {
                     const child_id = childs_list[i];
                     const parent_id = parents_list[i];
-                    if (parent_id >= 0) doc.instances.items[@intCast(child_id)].Parent = @intCast(parent_id);
+                    if (parent_id >= 0)
+                        doc.instances.items[@intCast(child_id)].Parent = @intCast(parent_id);
                 }
             },
             .PROP => {
@@ -1110,23 +1164,28 @@ pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Roblox.Docume
 
                 switch (property_type) {
                     .String => {
-                        for (0..len) |i| values[i] = .{ .String = try allocator.dupe(u8, try chunk_reader.readBuffer()) };
+                        for (0..len) |i|
+                            values[i] = .{ .String = try allocator.dupe(u8, try chunk_reader.readBuffer()) };
                     },
                     .Bool => {
-                        for (0..len) |i| values[i] = .{ .Bool = try chunk_reader.readByte() != 0 };
+                        for (0..len) |i|
+                            values[i] = .{ .Bool = try chunk_reader.readByte() != 0 };
                     },
                     .Int => {
                         const list = try chunk_reader.readAllocInterleavedi32(allocator, len);
                         defer allocator.free(list);
-                        for (0..len) |i| values[i] = .{ .Int = list[i] };
+                        for (0..len) |i|
+                            values[i] = .{ .Int = list[i] };
                     },
                     .Float => {
                         const list = try chunk_reader.readAllocInterleavedf32(allocator, len);
                         defer allocator.free(list);
-                        for (0..len) |i| values[i] = .{ .Float = list[i] };
+                        for (0..len) |i|
+                            values[i] = .{ .Float = list[i] };
                     },
                     .Double => {
-                        for (0..len) |i| values[i] = .{ .Double = try chunk_reader.readf64() };
+                        for (0..len) |i|
+                            values[i] = .{ .Double = try chunk_reader.readf64() };
                     },
                     .UDim => {
                         const scales = try chunk_reader.readAllocInterleavedf32(allocator, len);
@@ -1134,7 +1193,8 @@ pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Roblox.Docume
                         const offsets = try chunk_reader.readAllocInterleavedi32(allocator, len);
                         defer allocator.free(offsets);
 
-                        for (0..len) |i| values[i] = .{ .UDim = .{ scales[i], offsets[i] } };
+                        for (0..len) |i|
+                            values[i] = .{ .UDim = .{ scales[i], offsets[i] } };
                     },
                     .UDim2 => {
                         const scales_x = try chunk_reader.readAllocInterleavedf32(allocator, len);
@@ -1147,7 +1207,8 @@ pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Roblox.Docume
                         const offsets_y = try chunk_reader.readAllocInterleavedi32(allocator, len);
                         defer allocator.free(offsets_y);
 
-                        for (0..len) |i| values[i] = .{ .UDim2 = .{ scales_x[i], offsets_x[i], scales_y[i], offsets_y[i] } };
+                        for (0..len) |i|
+                            values[i] = .{ .UDim2 = .{ scales_x[i], offsets_x[i], scales_y[i], offsets_y[i] } };
                     },
                     .Ray => {
                         for (0..len) |i| {
@@ -1162,15 +1223,18 @@ pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Roblox.Docume
                         }
                     },
                     .Faces => {
-                        for (0..len) |i| values[i] = .{ .Faces = try chunk_reader.readByte() };
+                        for (0..len) |i|
+                            values[i] = .{ .Faces = try chunk_reader.readByte() };
                     },
                     .Axes => {
-                        for (0..len) |i| values[i] = .{ .Axes = try chunk_reader.readByte() };
+                        for (0..len) |i|
+                            values[i] = .{ .Axes = try chunk_reader.readByte() };
                     },
                     .BrickColor => {
                         const list = try chunk_reader.readAllocInterleavedi32(allocator, len);
                         defer allocator.free(list);
-                        for (0..len) |i| values[i] = .{ .BrickColor = list[i] };
+                        for (0..len) |i|
+                            values[i] = .{ .BrickColor = list[i] };
                     },
                     .Color3 => {
                         const r = try chunk_reader.readAllocInterleavedf32(allocator, len);
@@ -1179,14 +1243,16 @@ pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Roblox.Docume
                         defer allocator.free(g);
                         const b = try chunk_reader.readAllocInterleavedf32(allocator, len);
                         defer allocator.free(b);
-                        for (0..len) |i| values[i] = .{ .Color3 = .{ r[i], g[i], b[i] } };
+                        for (0..len) |i|
+                            values[i] = .{ .Color3 = .{ r[i], g[i], b[i] } };
                     },
                     .Vector2 => {
                         const x = try chunk_reader.readAllocInterleavedf32(allocator, len);
                         defer allocator.free(x);
                         const y = try chunk_reader.readAllocInterleavedf32(allocator, len);
                         defer allocator.free(y);
-                        for (0..len) |i| values[i] = .{ .Vector2 = .{ x[i], y[i] } };
+                        for (0..len) |i|
+                            values[i] = .{ .Vector2 = .{ x[i], y[i] } };
                     },
                     .Vector3 => {
                         const x = try chunk_reader.readAllocInterleavedf32(allocator, len);
@@ -1195,11 +1261,13 @@ pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Roblox.Docume
                         defer allocator.free(y);
                         const z = try chunk_reader.readAllocInterleavedf32(allocator, len);
                         defer allocator.free(z);
-                        for (0..len) |i| values[i] = .{ .Vector3 = .{ x[i], y[i], z[i] } };
+                        for (0..len) |i|
+                            values[i] = .{ .Vector3 = .{ x[i], y[i], z[i] } };
                     },
                     .CFrame, .Quaternion, .OptionalCFrame => |t| {
                         if (t == .OptionalCFrame and try chunk_reader.readByte() != @intFromEnum(Roblox.Property.Type.CFrame) + 1) {
-                            for (0..len) |i| values[i] = .{ .OptionalCFrame = null };
+                            for (0..len) |i|
+                                values[i] = .{ .OptionalCFrame = null };
                         } else {
                             const matrices = try allocator.alloc(struct { f32, f32, f32, f32, f32, f32, f32, f32, f32 }, len);
                             defer allocator.free(matrices);
@@ -1207,30 +1275,126 @@ pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Roblox.Docume
                                 const orient_id: u8 = try chunk_reader.readByte();
                                 if (orient_id > 0) {
                                     switch (orient_id) {
-                                        0x02 => matrices[i] = .{ 1, 0, 0, 0, 1, 0, 0, 0, 1 },
-                                        0x03 => matrices[i] = .{ 1, 0, 0, 0, 0, -1, 0, 1, 0 },
-                                        0x05 => matrices[i] = .{ 1, 0, 0, 0, -1, 0, 0, 0, -1 },
-                                        0x06 => matrices[i] = .{ 1, 0, 0, 0, 0, 1, 0, -1, 0 },
-                                        0x07 => matrices[i] = .{ 0, 1, 0, 1, 0, 0, 0, 0, -1 },
-                                        0x09 => matrices[i] = .{ 0, 0, 1, 1, 0, 0, 0, 1, 0 },
-                                        0x0a => matrices[i] = .{ 0, -1, 0, 1, 0, 0, 0, 0, 1 },
-                                        0x0c => matrices[i] = .{ 0, 0, -1, 1, 0, 0, 0, -1, 0 },
-                                        0x0d => matrices[i] = .{ 0, 1, 0, 0, 0, 1, 1, 0, 0 },
-                                        0x0e => matrices[i] = .{ 0, 0, -1, 0, 1, 0, 1, 0, 0 },
-                                        0x10 => matrices[i] = .{ 0, -1, 0, 0, 0, -1, 1, 0, 0 },
-                                        0x11 => matrices[i] = .{ 0, 0, 1, 0, -1, 0, 1, 0, 0 },
-                                        0x14 => matrices[i] = .{ -1, 0, 0, 0, 1, 0, 0, 0, -1 },
-                                        0x15 => matrices[i] = .{ -1, 0, 0, 0, 0, 1, 0, 1, 0 },
-                                        0x17 => matrices[i] = .{ -1, 0, 0, 0, -1, 0, 0, 0, 1 },
-                                        0x18 => matrices[i] = .{ -1, 0, 0, 0, 0, -1, 0, -1, 0 },
-                                        0x19 => matrices[i] = .{ 0, 1, 0, -1, 0, 0, 0, 0, 1 },
-                                        0x1b => matrices[i] = .{ 0, 0, 1, -1, 0, 0, 0, 1, 0 },
-                                        0x1c => matrices[i] = .{ 0, -1, 0, -1, 0, 0, 0, 0, -1 },
-                                        0x1e => matrices[i] = .{ 0, 0, -1, -1, 0, 0, 0, -1, 0 },
-                                        0x1f => matrices[i] = .{ 0, 1, 0, 0, 0, -1, -1, 0, 0 },
-                                        0x20 => matrices[i] = .{ 0, 0, 1, 0, 1, 0, -1, 0, 0 },
-                                        0x22 => matrices[i] = .{ 0, -1, 0, 0, 0, 1, -1, 0, 0 },
-                                        0x23 => matrices[i] = .{ 0, 0, -1, 0, -1, 0, -1, 0, 0 },
+                                        0x02 => matrices[i] = .{
+                                            1, 0, 0,
+                                            0, 1, 0,
+                                            0, 0, 1,
+                                        },
+                                        0x03 => matrices[i] = .{
+                                            1, 0, 0,
+                                            0, 0, -1,
+                                            0, 1, 0,
+                                        },
+                                        0x05 => matrices[i] = .{
+                                            1, 0,  0,
+                                            0, -1, 0,
+                                            0, 0,  -1,
+                                        },
+                                        0x06 => matrices[i] = .{
+                                            1, 0,  0,
+                                            0, 0,  1,
+                                            0, -1, 0,
+                                        },
+                                        0x07 => matrices[i] = .{
+                                            0, 1, 0,
+                                            1, 0, 0,
+                                            0, 0, -1,
+                                        },
+                                        0x09 => matrices[i] = .{
+                                            0, 0, 1,
+                                            1, 0, 0,
+                                            0, 1, 0,
+                                        },
+                                        0x0a => matrices[i] = .{
+                                            0, -1, 0,
+                                            1, 0,  0,
+                                            0, 0,  1,
+                                        },
+                                        0x0c => matrices[i] = .{
+                                            0, 0,  -1,
+                                            1, 0,  0,
+                                            0, -1, 0,
+                                        },
+                                        0x0d => matrices[i] = .{
+                                            0, 1, 0,
+                                            0, 0, 1,
+                                            1, 0, 0,
+                                        },
+                                        0x0e => matrices[i] = .{
+                                            0, 0, -1,
+                                            0, 1, 0,
+                                            1, 0, 0,
+                                        },
+                                        0x10 => matrices[i] = .{
+                                            0, -1, 0,
+                                            0, 0,  -1,
+                                            1, 0,  0,
+                                        },
+                                        0x11 => matrices[i] = .{
+                                            0, 0,  1,
+                                            0, -1, 0,
+                                            1, 0,  0,
+                                        },
+                                        0x14 => matrices[i] = .{
+                                            -1, 0, 0,
+                                            0,  1, 0,
+                                            0,  0, -1,
+                                        },
+                                        0x15 => matrices[i] = .{
+                                            -1, 0, 0,
+                                            0,  0, 1,
+                                            0,  1, 0,
+                                        },
+                                        0x17 => matrices[i] = .{
+                                            -1, 0,  0,
+                                            0,  -1, 0,
+                                            0,  0,  1,
+                                        },
+                                        0x18 => matrices[i] = .{
+                                            -1, 0,  0,
+                                            0,  0,  -1,
+                                            0,  -1, 0,
+                                        },
+                                        0x19 => matrices[i] = .{
+                                            0,  1, 0,
+                                            -1, 0, 0,
+                                            0,  0, 1,
+                                        },
+                                        0x1b => matrices[i] = .{
+                                            0,  0, 1,
+                                            -1, 0, 0,
+                                            0,  1, 0,
+                                        },
+                                        0x1c => matrices[i] = .{
+                                            0,  -1, 0,
+                                            -1, 0,  0,
+                                            0,  0,  -1,
+                                        },
+                                        0x1e => matrices[i] = .{
+                                            0,  0,  -1,
+                                            -1, 0,  0,
+                                            0,  -1, 0,
+                                        },
+                                        0x1f => matrices[i] = .{
+                                            0,  1, 0,
+                                            0,  0, -1,
+                                            -1, 0, 0,
+                                        },
+                                        0x20 => matrices[i] = .{
+                                            0,  0, 1,
+                                            0,  1, 0,
+                                            -1, 0, 0,
+                                        },
+                                        0x22 => matrices[i] = .{
+                                            0,  -1, 0,
+                                            0,  0,  1,
+                                            -1, 0,  0,
+                                        },
+                                        0x23 => matrices[i] = .{
+                                            0,  0,  -1,
+                                            0,  -1, 0,
+                                            -1, 0,  0,
+                                        },
                                         else => return DeserializeError.BadCFrameRotationId,
                                     }
                                 } else if (t == .Quaternion) {
@@ -1258,7 +1422,8 @@ pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Roblox.Docume
                                     matrices[i] = .{ 1 - (yy + zz), xy - wz, xz + wy, xy + wz, 1 - (xx + zz), yz - wx, xz - wy, yz + wx, 1 - (xx + yy) };
                                 } else {
                                     var matrix: [9]f32 = .{ 0, 0, 0 } ** 3;
-                                    for (0..9) |m| matrix[m] = try chunk_reader.readf32();
+                                    for (0..9) |m|
+                                        matrix[m] = try chunk_reader.readf32();
                                     matrices[i] = .{ matrix[0], matrix[1], matrix[2], matrix[3], matrix[4], matrix[5], matrix[6], matrix[7], matrix[8] };
                                 }
                             }
@@ -1281,7 +1446,8 @@ pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Roblox.Docume
 
                             if (t == .OptionalCFrame) {
                                 if (try chunk_reader.readByte() != @intFromEnum(Roblox.Property.Type.Bool)) {
-                                    for (0..len) |i| values[i] = .{ .OptionalCFrame = null };
+                                    for (0..len) |i|
+                                        values[i] = .{ .OptionalCFrame = null };
                                 } else {
                                     for (0..len) |i| {
                                         if (try chunk_reader.readByte() == 0) {
@@ -1292,22 +1458,22 @@ pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Roblox.Docume
                                     }
                                 }
                             } else {
-                                for (0..len) |i| values[i] = .{ .CFrame = cframes[i] };
+                                for (0..len) |i|
+                                    values[i] = .{ .CFrame = cframes[i] };
                             }
                         }
                     },
                     .Enum => {
                         const enums = try chunk_reader.readAllocInterleavedu32(allocator, len);
                         defer allocator.free(enums);
-                        for (0..len) |i| {
-                            const value = enums[i];
-                            values[i] = .{ .Enum = .{ value, "Blank" } };
-                        }
+                        for (0..len) |i|
+                            values[i] = .{ .Enum = enums[i] };
                     },
                     .Ref => {
                         const list = try chunk_reader.readAllocInstances(allocator, len);
                         defer allocator.free(list);
-                        for (0..len) |i| values[i] = .{ .Ref = if (list[i] > 0) @intCast(list[i]) else null };
+                        for (0..len) |i|
+                            values[i] = .{ .Ref = if (list[i] > 0) @intCast(list[i]) else null };
                     },
                     .Vector3int16 => {
                         for (0..len) |i| {
@@ -1367,7 +1533,8 @@ pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Roblox.Docume
                         defer allocator.free(x1);
                         const y1 = try chunk_reader.readAllocInterleavedf32(allocator, len);
                         defer allocator.free(y1);
-                        for (0..len) |i| values[i] = .{ .Rect = .{ x0[i], y0[i], x1[i], y1[i] } };
+                        for (0..len) |i|
+                            values[i] = .{ .Rect = .{ x0[i], y0[i], x1[i], y1[i] } };
                     },
                     .PhysicalProperties => {
                         for (0..len) |i| {
@@ -1384,17 +1551,20 @@ pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Roblox.Docume
                         const r = chunk_reader.readChunk(len);
                         const g = chunk_reader.readChunk(len);
                         const b = chunk_reader.readChunk(len);
-                        for (0..len) |i| values[i] = .{ .Color3uint8 = .{ r[i], g[i], b[i] } };
+                        for (0..len) |i|
+                            values[i] = .{ .Color3uint8 = .{ r[i], g[i], b[i] } };
                     },
                     .Int64 => {
                         const list = try chunk_reader.readAllocInterleavedi64(allocator, len);
                         defer allocator.free(list);
-                        for (0..len) |i| values[i] = .{ .Int64 = list[i] };
+                        for (0..len) |i|
+                            values[i] = .{ .Int64 = list[i] };
                     },
                     .SharedString => {
                         const keys = try chunk_reader.readAllocInterleavedu32(allocator, len);
                         defer allocator.free(keys);
-                        for (0..len) |i| values[i] = .{ .SharedString = keys[i] };
+                        for (0..len) |i|
+                            values[i] = .{ .SharedString = keys[i] };
                     },
                     .ProtectedString => {
                         for (0..len) |i| {
@@ -1415,7 +1585,8 @@ pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Roblox.Docume
                         }.inner);
                         const ids = try interleaved(allocator, chunk_reader.readChunk(len * 16), len);
                         defer allocator.free(ids);
-                        for (0..len) |i| values[i] = .{ .UniqueId = ids[i] };
+                        for (0..len) |i|
+                            values[i] = .{ .UniqueId = ids[i] };
                     },
                     .FontFace => {
                         for (0..len) |i| {
@@ -1433,7 +1604,8 @@ pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Roblox.Docume
                     .SecurityCapabilities => {
                         const capabilities = try chunk_reader.readAllocInterleavedu64(allocator, len);
                         defer allocator.free(capabilities);
-                        for (0..len) |i| values[i] = .{ .SecurityCapabilities = capabilities[i] };
+                        for (0..len) |i|
+                            values[i] = .{ .SecurityCapabilities = capabilities[i] };
                     },
                     else => |t| std.debug.panic("(deserialize) Unhandled type: {}\n", .{t}),
                 }
@@ -1441,7 +1613,8 @@ pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Roblox.Docume
                 for (0..len) |i| {
                     const id = class.instances[i];
                     const instance = &doc.instances.items[@intCast(id)];
-                    if (instance.Properties.get(name) != null) return Roblox.DeserializeError.BadData;
+                    if (instance.Properties.get(name) != null)
+                        return Roblox.DeserializeError.BadData;
 
                     const copy = try allocator.dupe(u8, name);
                     errdefer allocator.free(copy);
@@ -1471,7 +1644,8 @@ pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Roblox.Docume
                 const format = try chunk_reader.readVarInt(i32, .little, 4);
                 const hash_len = try chunk_reader.readVarInt(u32, .little, 4);
 
-                if (format != 0) return DeserializeError.BadSharedStringFormat;
+                if (format != 0)
+                    return DeserializeError.BadSharedStringFormat;
 
                 for (0..@intCast(hash_len)) |_| {
                     _ = chunk_reader.readChunk(16);
@@ -1492,7 +1666,8 @@ pub fn deserialize(allocator: std.mem.Allocator, reader: anytype) !Roblox.Docume
         }
     }
 
-    if (!ended) return DeserializeError.BadDataNoEnd;
+    if (!ended)
+        return DeserializeError.BadDataNoEnd;
 
     return doc;
 }
@@ -1538,12 +1713,7 @@ test "Read/Write Chunk" {
 
     try chunk.finalize(buffer.writer(), true);
 
-    var read_buffer = std.ArrayList(u8).init(allocator);
-    defer read_buffer.deinit();
-
-    var stream = std.io.fixedBufferStream(buffer.items);
-
-    const read_chunk = try readChunk(stream.reader().any(), &read_buffer);
+    const read_chunk, _ = try readChunk(allocator, buffer.items);
     defer read_chunk.deinit(allocator);
     try std.testing.expectEqual(.META, read_chunk.Type);
     try std.testing.expectEqual(0, read_chunk.Reserved);
